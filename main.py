@@ -2,145 +2,122 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 import os
-import cv2
-from skimage import color
-from sklearn.preprocessing import StandardScaler
 
 class ImageKMeansSegmenter:
-    def __init__(self, image_path, resize_dim=(200, 200), seed=42):
-        self.image_path = image_path
-        self.resize_dim = resize_dim
+    def __init__(self, filepath, resize_size=(200, 200), seed=42):
+        self.filepath = filepath
+        self.resize_size = resize_size
         np.random.seed(seed)
-        self.img = self.load_image()
-        self.h, self.w, _ = self.img.shape
         
-        # Apply Gaussian blur to reduce noise
-        self.img_blurred = cv2.GaussianBlur(self.img, (5, 5), 0)
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"Cannot find image at '{filepath}'")
         
-        # Convert to Lab color space (expects float [0,1])
-        lab_img = color.rgb2lab(self.img_blurred / 255.0)
-        
-        # Flatten pixels (shape: [height*width, 3])
-        self.flat_pixels = lab_img.reshape(-1, 3)
-        
-        # Normalize Lab pixels using StandardScaler
-        self.scaler = StandardScaler()
-        self.flat_pixels = self.scaler.fit_transform(self.flat_pixels)
+        self.image = self._open_and_resize_image()
+        self.height, self.width, _ = self.image.shape
+        self.data = self.image.reshape(-1, 3).astype(np.float32)
 
-    def load_image(self):
-        if not os.path.exists(self.image_path):
-            raise FileNotFoundError(f"Image not found at: {self.image_path}")
-        img = Image.open(self.image_path).convert('RGB')
-        img = img.resize(self.resize_dim)
-        return np.array(img)
+    def _open_and_resize_image(self):
+        img = Image.open(self.filepath).convert("RGB")
+        img_resized = img.resize(self.resize_size)
+        return np.array(img_resized)
+    
+    def _choose_initial_centers(self, points, num_clusters):
+        n_points = points.shape[0]
+        centers = np.empty((num_clusters, points.shape[1]), dtype=points.dtype)
+        first_center_idx = np.random.choice(n_points)
+        centers[0] = points[first_center_idx]
 
-    def initialize_centroids_kmeans_pp(self, X, k):
-        n_samples = X.shape[0]
-        centroids = np.empty((k, X.shape[1]), dtype=X.dtype)
+        min_dist_sq = np.full(n_points, np.inf)
 
-        centroid_idx = np.random.choice(n_samples)
-        centroids[0] = X[centroid_idx]
-        closest_dist_sq = np.full(n_samples, np.inf)
+        for i in range(1, num_clusters):
+            dist_sq = np.sum((points - centers[i-1])**2, axis=1)
+            min_dist_sq = np.minimum(min_dist_sq, dist_sq)
+            probabilities = min_dist_sq / min_dist_sq.sum()
+            next_center_idx = np.random.choice(n_points, p=probabilities)
+            centers[i] = points[next_center_idx]
 
-        for c_id in range(1, k):
-            dist_sq = np.sum((X - centroids[c_id - 1]) ** 2, axis=1)
-            closest_dist_sq = np.minimum(closest_dist_sq, dist_sq)
-            prob = closest_dist_sq / closest_dist_sq.sum()
-            next_centroid_idx = np.random.choice(n_samples, p=prob)
-            centroids[c_id] = X[next_centroid_idx]
+        return centers
+    
+    def _classify_pixels(self, data, centers):
+        distances = np.sqrt(np.sum((data[:, None] - centers)**2, axis=2))
+        return np.argmin(distances, axis=1)
+    
+    def _recompute_centers(self, data, labels, num_clusters):
+        new_centers = []
+        for cluster_id in range(num_clusters):
+            cluster_points = data[labels == cluster_id]
+            if len(cluster_points) > 0:
+                new_centers.append(cluster_points.mean(axis=0))
+            else:
+                new_centers.append(data[np.random.choice(len(data))])
+        return np.array(new_centers)
 
-        return centroids
-
-    def assign_clusters(self, X, centroids):
-        distances = np.sqrt(((X - centroids[:, np.newaxis]) ** 2).sum(axis=2))
-        return np.argmin(distances, axis=0)
-
-    def update_centroids(self, X, labels, k):
-        new_centroids = np.array([
-            X[labels == i].mean(axis=0) if np.any(labels == i) else X[np.random.choice(len(X))]
-            for i in range(k)
-        ])
-        return new_centroids
-
-    def kmeans(self, X, k, max_iters=100):
-        centroids = self.initialize_centroids_kmeans_pp(X, k)
-        for _ in range(max_iters):
-            labels = self.assign_clusters(X, centroids)
-            new_centroids = self.update_centroids(X, labels, k)
-            if np.allclose(centroids, new_centroids, atol=1e-4):
+    def _run_kmeans(self, data, num_clusters, iterations=100):
+        centers = self._choose_initial_centers(data, num_clusters)
+        for _ in range(iterations):
+            labels = self._classify_pixels(data, centers)
+            updated_centers = self._recompute_centers(data, labels, num_clusters)
+            if np.allclose(centers, updated_centers, atol=1e-4):
                 break
-            centroids = new_centroids
-        inertia = np.sum((X - centroids[labels]) ** 2)
-        return centroids, labels, inertia
-
-    def extract_colored_number(self, labels, k):
-        """
-        Highlights the smallest cluster in the image with fixed green color.
-        """
-        counts = np.bincount(labels, minlength=k)
-        number_cluster = np.argmin(counts)
-
-        result_img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        mask = labels.reshape(self.h, self.w)
-
-        # Always color green to highlight selected cluster
-        result_img[mask == number_cluster] = [0, 255, 0]  # green color
-
-        return result_img
-
-    def process_for_k_values(self, k_values):
-        results = []
+            centers = updated_centers
+        total_inertia = np.sum((data - centers[labels]) ** 2)
+        return centers, labels, total_inertia
+    
+    def _highlight_smallest_group_cluster(self, labels, num_clusters):
+        pixel_counts = np.bincount(labels, minlength=num_clusters)
+        target_cluster = np.argmin(pixel_counts)
+        highlighted_image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        label_reshaped = labels.reshape(self.height, self.width)
+        highlighted_image[label_reshaped == target_cluster] = [0, 255, 0]  # Green highlight
+        return highlighted_image
+    
+    def analyze_image(self, clusters_range=range(2, 8)):
+        segmented_images = []
         inertias = []
-        for k in k_values:
-            centroids, labels, inertia = self.kmeans(self.flat_pixels, k)
-            result_img = self.extract_colored_number(labels, k)
-            results.append((k, result_img))
+        for k in clusters_range:
+            centers, labels, inertia = self._run_kmeans(self.data, k)
+            visual = self._highlight_smallest_group_cluster(labels, k)
+            segmented_images.append((k, visual))
             inertias.append(inertia)
-        return results, inertias
+        return segmented_images, inertias, list(clusters_range)
 
     @staticmethod
-    def find_elbow_point(inertias):
-        diffs = np.diff(inertias)
-        ddiffs = np.diff(diffs)
-        elbow_idx = np.argmin(ddiffs) + 1
-        return elbow_idx
-
-    def plot_inertia(self, k_values, inertias):
-        plt.figure(figsize=(6, 4))
-        plt.plot(k_values, inertias, marker='o', linestyle='--', color='b')
-        plt.xlabel("K value")
-        plt.ylabel("Inertia")
-        plt.title("Elbow Method: Inertia vs K")
-        plt.grid(True)
-        plt.show()
-
-    def plot_segmented_image(self, segmented_img, k):
-        plt.figure(figsize=(6, 6))
-        plt.imshow(segmented_img)
-        plt.title(f"Extracted Number Using K = {k}")
-        plt.axis('off')
-        plt.show()
+    def detect_elbow_point(inertia_values):
+        first_diff = np.diff(inertia_values)
+        second_diff = np.diff(first_diff)
+        return np.argmin(second_diff) + 1  # Adjust index for second diff size
 
 
 if __name__ == "__main__":
-    image_path = r"D:\6.jpg"  # change as needed
+    image_path = r"D:\42.jpg"
     segmenter = ImageKMeansSegmenter(image_path)
 
     k_values = list(range(2, 8))
+    results, inertias, _ = segmenter.analyze_image(k_values)
 
-    results, inertias = segmenter.process_for_k_values(k_values)
+    # Plot inertia curve
+    plt.figure(figsize=(8,5))
+    plt.plot(k_values, inertias, marker='o')
+    plt.xlabel('Number of clusters K')
+    plt.ylabel('Inertia (Sum of squared distances)')
+    plt.title('Elbow Method For Optimal K')
+    plt.grid(True)
+    plt.show()
 
-    segmenter.plot_inertia(k_values, inertias)
-
-    elbow_idx = segmenter.find_elbow_point(inertias)
+    # Find best K via elbow method
+    elbow_idx = ImageKMeansSegmenter.detect_elbow_point(inertias)
     best_k = k_values[elbow_idx]
     print(f"Best K detected by elbow method: {best_k}")
 
-    # Find result for best K and plot
+    # Display segmented image for best K
     best_result_img = None
     for k, segmented_img in results:
         if k == best_k:
             best_result_img = segmented_img
             break
 
-    segmenter.plot_segmented_image(best_result_img, best_k)
+    plt.figure(figsize=(6,6))
+    plt.imshow(best_result_img)
+    plt.title(f'Segmented Image with K={best_k} (Smallest Group Highlighted)')
+    plt.axis('off')
+    plt.show()
